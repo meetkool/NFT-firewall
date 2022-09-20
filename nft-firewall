@@ -1,0 +1,84 @@
+#!/usr/sbin/nft
+# nft firewall script
+# ©2020, NARDCARD
+# This essentially implements a simple yet powerful firewall for a desktop pc. Not intended for routing devices.
+# You must adjust at least the name of your network device in the ingresstable below!
+# nft syntax has changed over the time, so be prepared that it does not run on your device.
+# Keeps processor load low, even under some flooding attacks. If flooding attack is a serious problem for you
+# have a look at fail2ban and maybe also look at cloudflare.com.
+# This is tested with version 0.9.2 on Ubuntu Linux.and kernel 5.5.x. Have a look at netfilter.org and wiki.nftables.org
+#
+flush ruleset                          # start with wiping all rules and tables
+define PermanentBlacklist = { 209.123.16.20, 193.69.116.2, 10.0.0.0/8 }   # whatever you need here…
+
+############## INGRESS ######### ingress hook is new compared to iptables. It is the least expensive filter instance.
+table netdev ingressfilter {
+   chain ingress {
+      type filter hook ingress device "enp2s0" priority -500; policy accept;   # syntax changes in version >= 0.9.2, before that device string must be unquoted
+
+      udp sport 389 drop        # specific to LDAP amplification attack: if you have ldap in use comment out this line!
+      tcp sport 389 drop        # specific to LDAP amplification attack: if you have ldap in use comment out this line!
+      ip saddr $PermanentBlacklist drop               # this simply permanently blocks all IPs/networks on the named list
+      icmp type { destination-unreachable, source-quench, redirect, time-exceeded, parameter-problem } limit rate over 30/minute  counter drop
+      ip protocol { esp, ah, gre, idrp, ddp } drop     # drop – unless you use ipsec  and that other stuff (unlikely on a desktop pc)
+      ip saddr 127.0.0.1/8 iif !=lo drop               # drop traffic pretending originated from lo on external interfaces, generally good idea
+   }
+}
+
+table inet MainTable {
+    set blacklist-v4    {  type ipv4_addr; size 65535; flags dynamic,timeout;    }   # dynamic set to control individual client's new connection rate, requires version >=0.9.2 
+    set blacklist-v6    {  type ipv6_addr; size 65535; flags dynamic,timeout;    }   # dynamic set to control individual client's new connection rate, requires version >=0.9.2 
+#####################  PREROUTING ############################
+   chain prerouting {
+      type filter hook prerouting priority 0; policy accept;
+      ip frag-off & 0x1fff != 0 counter drop     # fragmented packets are not generally bad, although this may help to defend against udp fragmentation attack
+      tcp flags & (fin|syn) == fin|syn drop      # bogus flags, usually a good idea to drop those packets
+      tcp flags & (syn|rst) == syn|rst drop      # bogus flags
+      tcp flags & (fin|rst) == fin|rst drop      # bogus flags
+      tcp flags & (fin|ack) == fin drop          # bogus flags
+      tcp flags & (ack|urg) == urg drop          # bogus flags
+      tcp flags & (fin|ack) == fin drop          # bogus flags
+      tcp flags & (psh|ack) == psh drop          # bogus flags
+      tcp flags & (fin|syn|rst|psh|ack|urg) == fin|syn|rst|psh|ack|urg drop      # bogus flags
+      tcp flags & (fin|syn|rst|psh|ack|urg) == fin|psh|urg             drop      # bogus flags
+      tcp flags & (fin|syn|rst|psh|ack|urg) == fin|syn|psh|urg         drop      # bogus flags
+      tcp flags & (fin|syn|rst|psh|ack|urg) == fin|syn|rst|ack|urg     drop      # bogus flags
+      tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0                     drop      # bogus flags
+      tcp flags & (fin|syn|rst|ack) != syn ct state new                drop      # bogus flags
+      ct state invalid drop
+   }
+################## Incoming Traffic ##########################
+   chain incoming {
+      type filter hook input priority 1; policy drop;
+
+      iif lo accept                           # Allow loopback interface, should be ok.
+# add source ip addresses with timeout to the backlist if more than 10 tcp connection requests occured per second and ip address.
+# entries will timeout after given time, after which they might be re-added if limit condition persists.
+      tcp dport ssh   ct state new,untracked meter flood-ipv4-ssh  { ip saddr timeout 10s limit rate over 10/second }  add @blacklist-v4 { ip saddr timeout 1m }
+      ct state new,untracked meter flood-ipv4-rest { ip  saddr timeout 10s limit rate over 1000/second } add @blacklist-v4 { ip  saddr timeout 2m }
+      ct state new,untracked meter flood-ip6       { ip6 saddr timeout 10s limit rate over 1000/second } add @blacklist-v6 { ip6 saddr timeout 3m }
+# if an IP is on the blacklist list we drop ALL packets from this ip, not only the "new" packets. That would happen if drop was in the rules above.
+      ip  saddr @blacklist-v4  log prefix "new ratev4 exceeded:" drop
+      ip6 saddr @blacklist-v6  log prefix "new ratev6 exceeded:" drop    # set references cannot be combined in another set, so separate rules are required
+
+      tcp dport { ipp, 1024-65535 } accept        # allow traffic to local running services like ipp, pulseaudio or avahi …
+      udp dport { ipp, 1024-65535 } accept        # 
+      ip protocol { icmp, igmp } accept                 # Allow ICMPv4 and IGMP (Multicast is not unusual on a desktop pc)
+      ip protocol !={ icmp, tcp, udp } log    # you may want to log protocols that are unusual on a desktop pc – not required, just nice to have
+      ip6 nexthdr icmpv6 accept               # Allow ICMPv6 traffic (https://tools.ietf.org/html/rfc4890#page-18)
+      ct state established,related accept     # Allow packets to established/related connections 
+
+      ip protocol tcp reject with tcp reset        # Reject all other packets, by removing these lines the rest of the traffic gets just dropped
+      ip6 nexthdr tcp reject with tcp reset        #   by chain policy
+   }
+##################### Forward Traffic  #####################
+   chain forwarding {
+      type filter hook forward priority 1; policy accept;
+      ip protocol { tcp, udp } log
+   }
+##################### Outgoing Traffic #####################
+   chain outgoing {
+      type filter hook output priority 1; policy accept; 
+      oif lo accept                          # Allow loopback interface
+   }
+}
